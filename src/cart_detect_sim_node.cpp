@@ -63,7 +63,8 @@ void CartDetectSimNode::loadInitialCarts()
   for (const auto & name : cart_names) {
     SimCart cart;
     cart.id   = declare_parameter<int>(name + ".id", 0);
-    cart.type = static_cast<uint8_t>(declare_parameter<int>(name + ".type", 1));
+    const int type_val = declare_parameter<int>(name + ".type", 1);
+    cart.type = static_cast<uint8_t>(std::clamp(type_val, 0, 255));
     cart.x    = declare_parameter<double>(name + ".x", 0.0);
     cart.y    = declare_parameter<double>(name + ".y", 0.0);
     cart.yaw  = declare_parameter<double>(name + ".yaw", 0.0);
@@ -79,33 +80,47 @@ void CartDetectSimNode::onDetect(
   const cart_detect::srv::GetCarts::Request::SharedPtr req,
   cart_detect::srv::GetCarts::Response::SharedPtr res)
 {
-  std::lock_guard<std::mutex> lk(mtx_);
-
-  if (!detection_enabled_) {
-    RCLCPP_DEBUG(get_logger(), "[detect] detection disabled, returning empty");
-    return;
+  // [P1 fix] Read detection_enabled_ under lock, then release before TF lookup
+  // [P2 fix] Consistent synchronization for detection_enabled_
+  std::map<int32_t, SimCart> carts_snapshot;
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!detection_enabled_) {
+      RCLCPP_DEBUG(get_logger(), "[detect] detection disabled, returning empty");
+      return;
+    }
+    if (carts_.empty()) {
+      RCLCPP_DEBUG(get_logger(), "[detect] no carts registered");
+      return;
+    }
+    carts_snapshot = carts_;
   }
-
-  if (carts_.empty()) {
-    RCLCPP_DEBUG(get_logger(), "[detect] no carts registered");
-    return;
-  }
+  // [P2 fix] Mutex released before blocking TF call
 
   // Get robot position in map frame via TF
   const std::string & source_frame = req->source_frame;
   geometry_msgs::msg::TransformStamped robot_tf;
-  bool have_robot_tf = false;
 
   try {
     robot_tf = tf_buffer_.lookupTransform(
       map_frame_id_, source_frame, tf2::TimePointZero,
       tf2::durationFromSec(0.5));
-    have_robot_tf = true;
   } catch (const tf2::TransformException & ex) {
+    // [P1 fix] Without TF we cannot compute source_frame-relative coords; return empty
     RCLCPP_WARN(get_logger(),
-      "[detect] cannot look up %s -> %s: %s",
+      "[detect] cannot look up %s -> %s: %s  -- returning empty",
       map_frame_id_.c_str(), source_frame.c_str(), ex.what());
+    return;
   }
+
+  const double rx = robot_tf.transform.translation.x;
+  const double ry = robot_tf.transform.translation.y;
+  const auto & rq = robot_tf.transform.rotation;
+  const double robot_yaw = std::atan2(
+    2.0 * (rq.w * rq.z + rq.x * rq.y),
+    1.0 - 2.0 * (rq.y * rq.y + rq.z * rq.z));
+  const double cos_r = std::cos(-robot_yaw);
+  const double sin_r = std::sin(-robot_yaw);
 
   struct CartWithDistance {
     cart_detect::msg::CartTransform ct;
@@ -113,60 +128,32 @@ void CartDetectSimNode::onDetect(
   };
   std::vector<CartWithDistance> results;
 
-  for (const auto & [id, cart] : carts_) {
-    // Filter by ID range (same as production: 30-99)
+  for (const auto & [id, cart] : carts_snapshot) {
     if (id < cart_detect::srv::GetCarts::Request::CART_ID_MIN ||
         id > cart_detect::srv::GetCarts::Request::CART_ID_MAX) {
       continue;
     }
 
-    // Compute relative transform: source_frame -> cart
-    double dx = cart.x;
-    double dy = cart.y;
-    double dist = 0.0;
+    const double dx = cart.x - rx;
+    const double dy = cart.y - ry;
+    const double dist = std::sqrt(dx * dx + dy * dy);
 
-    if (have_robot_tf) {
-      const double rx = robot_tf.transform.translation.x;
-      const double ry = robot_tf.transform.translation.y;
-      dx = cart.x - rx;
-      dy = cart.y - ry;
-      dist = std::sqrt(dx * dx + dy * dy);
-
-      // Distance filter
-      if (dist > max_detection_distance_) {
-        continue;
-      }
-
-      // Transform delta into source_frame coordinates
-      // Extract robot yaw from quaternion
-      const auto & q = robot_tf.transform.rotation;
-      const double siny = 2.0 * (q.w * q.z + q.x * q.y);
-      const double cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
-      const double robot_yaw = std::atan2(siny, cosy);
-
-      const double cos_r = std::cos(-robot_yaw);
-      const double sin_r = std::sin(-robot_yaw);
-      const double local_x = dx * cos_r - dy * sin_r;
-      const double local_y = dx * sin_r + dy * cos_r;
-      dx = local_x;
-      dy = local_y;
+    if (dist > max_detection_distance_) {
+      continue;
     }
+
+    // Transform into source_frame coordinates
+    const double local_x = dx * cos_r - dy * sin_r;
+    const double local_y = dx * sin_r + dy * cos_r;
+    const double rel_yaw = cart.yaw - robot_yaw;
 
     cart_detect::msg::CartTransform ct;
     ct.id = id;
     ct.type = cart.type;
-    ct.transform.translation.x = dx;
-    ct.transform.translation.y = dy;
+    ct.transform.translation.x = local_x;
+    ct.transform.translation.y = local_y;
     ct.transform.translation.z = 0.0;
 
-    // Cart orientation relative to robot
-    double rel_yaw = cart.yaw;
-    if (have_robot_tf) {
-      const auto & q = robot_tf.transform.rotation;
-      const double siny = 2.0 * (q.w * q.z + q.x * q.y);
-      const double cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
-      rel_yaw = cart.yaw - std::atan2(siny, cosy);
-    }
     tf2::Quaternion quat;
     quat.setRPY(0.0, 0.0, rel_yaw);
     ct.transform.rotation.x = quat.x();
@@ -177,7 +164,6 @@ void CartDetectSimNode::onDetect(
     results.push_back({ct, dist});
   }
 
-  // Sort by distance (closest first)
   std::sort(results.begin(), results.end(),
     [](const CartWithDistance & a, const CartWithDistance & b) {
       return a.distance < b.distance;
@@ -187,7 +173,8 @@ void CartDetectSimNode::onDetect(
     res->transforms.push_back(r.ct);
   }
 
-  RCLCPP_INFO(get_logger(),
+  // [P2 fix] DEBUG instead of INFO to avoid log spam
+  RCLCPP_DEBUG(get_logger(),
     "[detect] source_frame=%s, returning %zu cart(s)",
     source_frame.c_str(), res->transforms.size());
 }
@@ -196,7 +183,10 @@ void CartDetectSimNode::onEnableDetection(
   const std_srvs::srv::SetBool::Request::SharedPtr req,
   std_srvs::srv::SetBool::Response::SharedPtr res)
 {
-  detection_enabled_ = req->data;
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    detection_enabled_ = req->data;
+  }
   res->success = true;
   res->message = detection_enabled_ ? "Detection enabled" : "Detection disabled";
   RCLCPP_INFO(get_logger(), "[enable_detection] %s", res->message.c_str());
@@ -214,6 +204,18 @@ void CartDetectSimNode::onSetCart(
   cart.x    = req->x;
   cart.y    = req->y;
   cart.yaw  = req->yaw;
+
+  // [P2 fix] Validate ID range
+  if (req->id < cart_detect::srv::GetCarts::Request::CART_ID_MIN ||
+      req->id > cart_detect::srv::GetCarts::Request::CART_ID_MAX) {
+    res->success = false;
+    RCLCPP_WARN(get_logger(),
+      "[set_cart] rejected cart id=%d: must be in range [%d, %d]",
+      req->id,
+      cart_detect::srv::GetCarts::Request::CART_ID_MIN,
+      cart_detect::srv::GetCarts::Request::CART_ID_MAX);
+    return;
+  }
 
   const bool exists = carts_.count(req->id) > 0;
   carts_[req->id] = cart;
