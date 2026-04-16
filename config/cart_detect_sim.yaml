@@ -1,0 +1,11 @@
+cart_detect_sim:
+  ros__parameters:
+    max_detection_distance: 5.0
+    map_frame_id: "map"
+    initial_carts: ["cart_30"]
+    cart_30:
+      id: 30
+      type: 1
+      x: 5.0
+      y: 2.0
+      yaw: 0.0
