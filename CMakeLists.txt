@@ -12,6 +12,7 @@ find_package(std_srvs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(sim_world_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 # Generate custom service interfaces (SetCart, RemoveCart)
@@ -32,6 +33,7 @@ ament_target_dependencies(cart_detect_sim_node
   geometry_msgs
   tf2
   tf2_ros
+  sim_world_msgs
 )
 target_include_directories(cart_detect_sim_node
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

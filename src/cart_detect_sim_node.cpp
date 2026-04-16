@@ -22,6 +22,7 @@ CartDetectSimNode::CartDetectSimNode(const rclcpp::NodeOptions & options)
   // e.g. initial_carts: ["cart_30", "cart_31"]
   // cart_30.id: 30, cart_30.type: 1, cart_30.x: 5.0, cart_30.y: 2.0, cart_30.yaw: 0.0
   declare_parameter<std::vector<std::string>>("initial_carts", std::vector<std::string>{});
+  use_sim_world_ = declare_parameter<bool>("use_sim_world", false);
 
   // --- Services ---
 
@@ -48,7 +49,18 @@ CartDetectSimNode::CartDetectSimNode(const rclcpp::NodeOptions & options)
     std::bind(&CartDetectSimNode::onRemoveCart, this,
               std::placeholders::_1, std::placeholders::_2));
 
-  loadInitialCarts();
+  // --- sim_world integration (optional) ---
+  if (use_sim_world_) {
+    auto qos = rclcpp::QoS(1)
+      .reliable()
+      .transient_local();
+    sub_sim_world_carts_ = create_subscription<sim_world_msgs::msg::SimCartArray>(
+      "/sim_world/carts", qos,
+      std::bind(&CartDetectSimNode::onSimWorldCarts, this, std::placeholders::_1));
+    RCLCPP_INFO(get_logger(), "use_sim_world=true, subscribing to /sim_world/carts");
+  } else {
+    loadInitialCarts();
+  }
 
   RCLCPP_INFO(get_logger(),
     "cart_detect_sim ready: %zu carts loaded, detection=%s, max_distance=%.1fm",
@@ -241,6 +253,24 @@ void CartDetectSimNode::onRemoveCart(
     res->success = false;
     RCLCPP_WARN(get_logger(), "[remove_cart] cart id=%d not found", req->id);
   }
+}
+
+void CartDetectSimNode::onSimWorldCarts(
+  const sim_world_msgs::msg::SimCartArray::SharedPtr msg)
+{
+  std::lock_guard<std::mutex> lk(mtx_);
+  carts_.clear();
+  for (const auto & c : msg->carts) {
+    SimCart cart;
+    cart.id   = c.id;
+    cart.type = c.type;
+    cart.x    = c.x;
+    cart.y    = c.y;
+    cart.yaw  = c.yaw;
+    carts_[c.id] = cart;
+  }
+  RCLCPP_DEBUG(get_logger(),
+    "[sim_world] received %zu carts", msg->carts.size());
 }
 
 }  // namespace cart_detect_sim
